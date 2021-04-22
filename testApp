@@ -1,0 +1,231 @@
+/*
+ * Copyright 2021-present Open Networking Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.first.app;
+
+import com.google.common.collect.ForwardingObject;
+import org.onlab.packet.Ethernet;
+import org.onlab.packet.MacAddress;
+import org.onosproject.core.ApplicationId;
+import org.onosproject.core.CoreService;
+import org.onosproject.net.*;
+import org.onosproject.net.flow.*;
+import org.onosproject.net.flowobjective.DefaultForwardingObjective;
+import org.onosproject.net.flowobjective.FlowObjectiveService;
+import org.onosproject.net.flowobjective.ForwardingObjective;
+import org.onosproject.net.packet.*;
+import org.onosproject.net.topology.TopologyService;
+import org.osgi.service.component.annotations.*;
+import org.onosproject.net.host.HostService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.Set;
+import java.util.concurrent.ThreadLocalRandom;
+
+/**
+ * Skeletal ONOS application component.
+ */
+@Component(immediate = true)
+public class AppComponent {
+
+
+    @Reference(cardinality = ReferenceCardinality.MANDATORY)
+    protected CoreService coreService;
+
+    @Reference(cardinality = ReferenceCardinality.MANDATORY)
+    protected PacketService packetService;
+
+    @Reference(cardinality = ReferenceCardinality.MANDATORY)
+    protected HostService hostService;
+
+    @Reference(cardinality = ReferenceCardinality.MANDATORY)
+    protected FlowObjectiveService flowObjectiveService;
+
+    @Reference(cardinality = ReferenceCardinality.MANDATORY)
+    protected FlowRuleService flowRuleService;
+
+    @Reference(cardinality = ReferenceCardinality.MANDATORY)
+    protected TopologyService topologyService;
+
+    private ApplicationId appId;
+
+    private ReactivePacketProcessor processor = new ReactivePacketProcessor();
+
+    private final Logger log = LoggerFactory.getLogger(getClass());
+
+    @Activate
+    protected void activate() {
+        appId = coreService.registerApplication("org.first.app");
+
+        packetService.addProcessor(processor, PacketProcessor.director(2));
+
+        installIpv4FlowRule();
+
+        log.info("Packet Logger application has been started with appId {}", appId);
+    }
+
+    @Deactivate
+    protected void deactivate() {
+        packetService.removeProcessor(processor);
+        processor = null;
+
+        removeIpv4FlowRule();
+        flowRuleService.removeFlowRulesById(appId);
+
+        log.info("Packet Logger application has been stopped with appId {}", appId);
+    }
+
+    private class ReactivePacketProcessor implements PacketProcessor {
+
+        @Override
+        public void process(PacketContext context) {
+
+            InboundPacket pkt = context.inPacket();
+            Ethernet ethPkt = pkt.parsed();
+
+            if (ethPkt.getEtherType() == Ethernet.TYPE_LLDP) {
+                //log.info("[---PACKLOGGED---]: from {} ETH_TYPE: LLDP", context.inPacket().receivedFrom());
+            }
+
+            if (ethPkt.getEtherType() == Ethernet.TYPE_ARP) {
+                log.info("[---PACKLOGGED---]: from {} ETH_TYPE: ARP", context.inPacket().receivedFrom());
+            }
+
+            if (ethPkt.getEtherType() == Ethernet.TYPE_IPV4) {
+                log.info("[---PACKLOGGED---]: from {} ETH_TYPE: IPv4", context.inPacket().receivedFrom());
+
+                //Identify the destination host
+                HostId id = HostId.hostId(ethPkt.getDestinationMAC());
+                Host dst = hostService.getHost(id);
+
+                //Identify the source host
+                HostId idSrc = HostId.hostId(ethPkt.getSourceMAC());
+                Host src = hostService.getHost(idSrc);
+
+
+                if (dst == null) {
+                    log.error("PCKLOG destination host is not known MAC {} ", ethPkt.getDestinationMAC());
+                    return;
+                }
+
+                if (src == null) {
+                    log.error("PCKLOG source host is not known MAC {} ", ethPkt.getSourceMAC());
+                    return;
+                }
+
+                log.info("PCKLOG source host {} to destination {} ", ethPkt.getSourceMAC(), ethPkt.getDestinationMAC());
+
+                DeviceId currentDeviceId = pkt.receivedFrom().deviceId();
+                DeviceId hostLocation = src.location().deviceId();
+
+                if (hostLocation.equals(currentDeviceId)) {
+                    log.info("PCKLOG NEW PCK source host {} to destination {} from device {}", ethPkt.getSourceMAC(),
+                            ethPkt.getDestinationMAC(), currentDeviceId);
+                }
+
+                DeviceId destLocation = dst.location().deviceId();
+                if (destLocation.equals(currentDeviceId)) {
+                    log.info("PCKLOG NEW delivered to destination {} through device {} from source {}",
+                            ethPkt.getDestinationMAC(),
+                            currentDeviceId, ethPkt.getSourceMAC());
+
+                    Set<Path> paths = topologyService.getPaths(
+                            topologyService.currentTopology(),
+                            src.location().deviceId(),
+                            dst.location().deviceId());
+
+                    log.warn("PCKLOG number {} paths are possible", paths.size());
+                    //log.warn("PCKLOG paths {} computed", paths);
+
+                    Path path = paths.iterator().next();
+
+                    log.info("PCKLOG.path:");
+                    for (Link link : path.links()) {
+                        log.info ("--- PATH link {}/{}->{}/{}",
+                                link.src().deviceId(),
+                                link.src().port(),
+                                link.dst().deviceId(),
+                                link.dst().port());
+                    }
+
+                    if (currentDeviceId.equals(DeviceId.deviceId("of:1000000000000006"))){
+                        log.warn("PCKROUTING flow rule installed on edge device using port 4");
+                        installRule(context, currentDeviceId, src.location().port(), PortNumber.portNumber(4));
+                    }
+                }
+            }
+        }
+    }
+
+    private void installRule(PacketContext context, DeviceId deviceId, PortNumber inPort, PortNumber outPort) {
+        InboundPacket pktIn = context.inPacket();
+        Ethernet ethPkt = pktIn.parsed();
+
+        MacAddress dstMAC = ethPkt.getDestinationMAC();
+        MacAddress srcMAC = ethPkt.getSourceMAC();
+
+        TrafficSelector selector = DefaultTrafficSelector.builder()
+                .matchEthSrc(srcMAC)
+                .matchEthDst(dstMAC)
+                .matchInPort(inPort)
+                .build();
+
+        TrafficTreatment treatment = DefaultTrafficTreatment.builder()
+                .setOutput(outPort)
+                .build();
+
+        // To generate a forwarding objective where the table ID is not specified.
+        // Table ID is automatically selected by the device driver
+        /*ForwardingObjective forwardingObjective = DefaultForwardingObjective.builder()
+                .withPriority(5)
+                .withSelector(selector)
+                .withTreatment(treatment)
+                .fromApp(appId)
+                .add();
+
+        flowObjectiveService.forward(deviceId, forwardingObjective);*/
+
+        //To directly generate the flow rule without using the driver
+        FlowRule rule = DefaultFlowRule.builder()
+                .withSelector(selector)
+                .withTreatment(treatment)
+                .withPriority(20)
+                .fromApp(appId)
+                .forTable(0)
+                .makePermanent()
+                .forDevice(deviceId)
+                .build();
+
+        flowRuleService.applyFlowRules(rule);
+    }
+
+
+    private void installIpv4FlowRule() {
+        TrafficSelector.Builder selector = DefaultTrafficSelector.builder();
+        selector.matchEthType(Ethernet.TYPE_IPV4);
+        packetService.requestPackets(selector.build(), PacketPriority.REACTIVE, appId);
+    }
+
+    /**
+     * Cancel request for packet in via packet service.
+     */
+    private void removeIpv4FlowRule() {
+        TrafficSelector.Builder selector = DefaultTrafficSelector.builder();
+        selector.matchEthType(Ethernet.TYPE_IPV4);
+        packetService.cancelPackets(selector.build(), PacketPriority.REACTIVE, appId);
+    }
+
+}
